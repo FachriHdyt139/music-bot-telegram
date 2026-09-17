@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import subprocess
 import httpx
 from aiohttp import web
 from telegram import Update
@@ -49,13 +50,13 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         video_id, title = await search_youtube(query)
         if not video_id:
-            await loading.edit_text("❌ **Lagu tidak ditemukan!** Coba judul lain.")
+            await loading.edit_text("❌ **Lagu tidak ditemukan!**")
             return
 
         logger.info(f"Found: {title} (ID: {video_id})")
         await loading.edit_text(f"📥 **Download:** {title}...")
 
-        result = await download_via_rapidapi(video_id, title)
+        result = await download_mp3(video_id, title)
         if result:
             audio_path, song_title = result
             if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
@@ -67,12 +68,11 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                 os.remove(audio_path)
                 await loading.edit_text(f"✅ **{song_title}**")
-            else:
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
-                await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
-        else:
-            await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
+                return
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+        await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await loading.edit_text("❌ **Error!** Coba lagi.")
@@ -91,33 +91,14 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_youtube(query: str):
-    """Search YouTube via Invidious API, return (video_id, title)"""
-    instances = [
-        "https://inv.nadeko.net",
-        "https://invidious.protokolla.fi",
-        "https://invidious.privacyredirect.com",
-        "https://vid.puffyan.us",
-        "https://yt.artemislena.eu",
-    ]
-
-    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        for instance in instances:
-            try:
-                url = f"{instance}/api/v1/search"
-                r = await client.get(url, params={"q": query, "type": "video", "sort_by": "relevance"})
-                if r.status_code == 200:
-                    results = r.json()
-                    for item in results:
-                        if item.get('type') == 'video' and item.get('videoId'):
-                            return item['videoId'], item.get('title', query)
-            except Exception as e:
-                logger.warning(f"Invidious {instance} failed: {e}")
-                continue
-
+    """Search YouTube via HTML scraping"""
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            url = "https://www.youtube.com/results"
-            r = await client.get(url, params={"search_query": query, "sp": "EgIQAQ%3D%3D"})
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.get(
+                "https://www.youtube.com/results",
+                params={"search_query": query, "sp": "EgIQAQ%3D%3D"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
             if r.status_code == 200:
                 text = r.text
                 idx = text.find('"videoId":"')
@@ -127,68 +108,129 @@ async def search_youtube(query: str):
                     video_id = text[start:end]
 
                     tidx = text.find('"title":{"runs":[{"text":"', start)
+                    title = query
                     if tidx > 0:
                         tstart = tidx + 26
                         tend = text.find('"', tstart)
                         title = text[tstart:tend]
-                    else:
-                        title = query
 
                     return video_id, title
     except Exception as e:
-        logger.error(f"YouTube search failed: {e}")
-
+        logger.error(f"Search failed: {e}")
     return None, None
 
 
-async def download_via_rapidapi(video_id: str, title: str):
-    """Download MP3 via RapidAPI YouTube MP3"""
+def download_ytdlp(video_id: str, title: str):
+    """Download via yt-dlp Python API (blocking, run in executor)"""
+    try:
+        import yt_dlp
+
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        output_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.mp3")
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'extract_audio': True,
+            'audio_format': 'mp3',
+            'audio_quality': '5',
+            'outtmpl': os.path.join(DOWNLOADS_DIR, f"{video_id}.%(ext)s"),
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_args': {'youtube': {'player_client': ['web']}},
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+
+        if os.path.exists(output_path):
+            return output_path
+
+        for f in os.listdir(DOWNLOADS_DIR):
+            if f.startswith(video_id) and f.endswith(('.mp3', '.m4a', '.webm', '.opus')):
+                return os.path.join(DOWNLOADS_DIR, f)
+
+        return None
+    except Exception as e:
+        logger.error(f"yt-dlp failed: {e}")
+        return None
+
+
+async def download_rapidapi(video_id: str, title: str):
+    """Download via RapidAPI + curl subprocess"""
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    file_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.mp3")
 
     try:
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            url = "https://youtube-mp36.p.rapidapi.com/dl"
-            headers = {
-                "Content-Type": "application/json",
-                "x-rapidapi-host": "youtube-mp36.p.rapidapi.com",
-                "x-rapidapi-key": RAPIDAPI_KEY
-            }
+        proc = await asyncio.create_subprocess_exec(
+            'curl', '-s',
+            f'https://youtube-mp36.p.rapidapi.com/dl?id={video_id}',
+            '-H', 'x-rapidapi-host: youtube-mp36.p.rapidapi.com',
+            '-H', f'x-rapidapi-key: {RAPIDAPI_KEY}',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
 
-            r = await client.get(url, headers=headers, params={"id": video_id})
-            logger.info(f"RapidAPI response: {r.status_code}")
+        if proc.returncode != 0:
+            logger.error("RapidAPI call failed")
+            return None
 
-            if r.status_code != 200:
-                logger.error(f"RapidAPI error: {r.text[:200]}")
-                return None
+        import json
+        data = json.loads(stdout.decode())
+        logger.info(f"RapidAPI: {data.get('status')}, size={data.get('filesize')}, dur={data.get('duration')}")
 
-            data = r.json()
-            logger.info(f"RapidAPI data: {data}")
+        if data.get('status') != 'ok' or not data.get('link'):
+            return None
 
-            if data.get('status') == 'ok':
-                download_url = data.get('link')
-                if not download_url:
-                    logger.error("No download link in response")
-                    return None
+        link = data['link']
+        song_title = data.get('title', title)
 
-                safe_title = data.get('title', title).replace('/', '-').replace('\\', '-')[:80]
-                file_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.mp3")
+        proc2 = await asyncio.create_subprocess_exec(
+            'curl', '-s', '-o', file_path, '-L',
+            '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            '-H', 'Referer: https://youtube-mp36.p.rapidapi.com/',
+            link,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc2.communicate()
 
-                r2 = await client.get(download_url)
-                if r2.status_code == 200:
-                    with open(file_path, 'wb') as f:
-                        f.write(r2.content)
-                    logger.info(f"Downloaded: {os.path.getsize(file_path)} bytes")
-                    return (file_path, safe_title)
-                else:
-                    logger.error(f"Download failed: {r2.status_code}")
-                    return None
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 1000:
+            ct = subprocess.run(
+                ['file', '--brief', file_path],
+                capture_output=True, text=True
+            ).stdout.strip()
+
+            if 'Audio' in ct or 'MPEG' in ct or 'MP3' in ct or 'ID3' in ct:
+                logger.info(f"RapidAPI OK: {os.path.getsize(file_path)} bytes")
+                return (file_path, song_title)
             else:
-                logger.error(f"RapidAPI status not ok: {data}")
+                logger.warning(f"Bad file type: {ct}")
+                os.remove(file_path)
                 return None
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return None
 
     except Exception as e:
-        logger.error(f"RapidAPI error: {e}", exc_info=True)
+        logger.error(f"RapidAPI failed: {e}")
+        if os.path.exists(file_path):
+            os.remove(file_path)
         return None
+
+
+async def download_mp3(video_id: str, title: str):
+    """Try yt-dlp first, then RapidAPI fallback"""
+
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, download_ytdlp, video_id, title)
+    if result:
+        return (result, title)
+
+    logger.info("yt-dlp failed, trying RapidAPI...")
+    return await download_rapidapi(video_id, title)
 
 
 async def run_bot():
@@ -196,7 +238,13 @@ async def run_bot():
         logger.error("BOT_TOKEN belum diisi!")
         return
 
-    logger.info(f"RapidAPI key: {'SET' if RAPIDAPI_KEY else 'MISSING'}")
+    logger.info(f"RapidAPI: {'SET' if RAPIDAPI_KEY else 'MISSING'}")
+
+    try:
+        import yt_dlp
+        logger.info(f"✅ yt-dlp available: {yt_dlp.version.__version__}")
+    except ImportError:
+        logger.warning("⚠️ yt-dlp not installed, using RapidAPI only")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -212,7 +260,7 @@ async def run_bot():
 
 
 async def handle_index(request):
-    return web.json_response({"status": "ok", "engine": "rapidapi"})
+    return web.json_response({"status": "ok", "engine": "ytdlp+rapidapi"})
 
 
 async def handle_health(request):
@@ -232,7 +280,7 @@ async def start_web_server():
 
 
 async def main():
-    logger.info("Starting with RapidAPI engine...")
+    logger.info("Starting...")
     await asyncio.gather(
         run_bot(),
         start_web_server()
