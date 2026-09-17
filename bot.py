@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 import base64
-import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -27,7 +26,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎵 **Music Bot Ready!**\n\n"
         "Ketik: `/p judul lagu`\n"
         "Contoh: `/p sampai jumpa`\n\n"
-        "Full durasi! 🎧",
+        "Full durasi dari YouTube! 🎧",
         parse_mode='Markdown'
     )
 
@@ -50,14 +49,7 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         logger.info(f"Search: {query}")
-
-        # Coba YouTube dulu (full durasi)
         result = await download_from_youtube(query)
-
-        # Kalau YouTube gagal, fallback ke Deezer (30 detik)
-        if not result:
-            logger.info("YouTube failed, trying Deezer...")
-            result = await download_from_deezer(query)
 
         if result:
             audio_path, title, artist = result
@@ -74,14 +66,14 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_audio(
                         audio=audio,
                         title=title[:100],
-                        performer=artist or "Unknown"
+                        performer=artist or "YouTube"
                     )
                 os.remove(audio_path)
-                await loading.edit_text(f"✅ **{title}** - {artist}")
+                await loading.edit_text(f"✅ **{title}**")
             else:
                 await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
         else:
-            await loading.edit_text("❌ **Lagu tidak ditemukan!** Coba judul lain.")
+            await loading.edit_text("❌ **Gagal!** Pastikan cookies valid.")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await loading.edit_text("❌ **Error!** Coba lagi.")
@@ -99,7 +91,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 
-# ========== YOUTUBE (FULL DURASI) ==========
+# ========== YOUTUBE DOWNLOAD ==========
 def setup_cookies_file():
     """Setup cookies file dari environment variable"""
     if not YOUTUBE_COOKIES:
@@ -122,22 +114,22 @@ def setup_cookies_file():
 
 
 async def download_from_youtube(query: str):
-    """Download audio dari YouTube pakai yt-dlp + cookies + node runtime"""
+    """Download audio dari YouTube pakai yt-dlp + cookies + node"""
     try:
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
+        # Bersihin file lama
         for f in os.listdir(DOWNLOADS_DIR):
             fp = os.path.join(DOWNLOADS_DIR, f)
             if os.path.isfile(fp) and not f.endswith('.txt'):
                 os.remove(fp)
 
         cookies_path = setup_cookies_file()
-
-        if not cookies_path or not os.path.exists(cookies_path):
-            logger.error("No cookies available!")
+        if not cookies_path:
+            logger.error("No cookies! Set YOUTUBE_COOKIES env var.")
             return None
 
-        # Step 1: Search untuk dapat video ID
+        # Cari video ID dulu
         search_cmd = [
             'yt-dlp',
             '--js-runtimes', 'node',
@@ -157,22 +149,20 @@ async def download_from_youtube(query: str):
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
-            logger.error(f"Search error: {stderr.decode()}")
+            logger.error(f"Search failed: {stderr.decode()}")
             return None
 
         output = stdout.decode().strip()
         if not output:
-            logger.error("No search results")
             return None
 
-        # Parse video ID dan title
         parts = output.split('|||')
         video_id = parts[0].strip()
         title = parts[1].strip() if len(parts) > 1 else query
 
         logger.info(f"Found: {title} (ID: {video_id})")
 
-        # Step 2: Download audio
+        # Download audio
         download_cmd = [
             'yt-dlp',
             '--js-runtimes', 'node',
@@ -188,7 +178,7 @@ async def download_from_youtube(query: str):
             f'https://www.youtube.com/watch?v={video_id}'
         ]
 
-        logger.info("Downloading audio...")
+        logger.info("Downloading...")
         process = await asyncio.create_subprocess_exec(
             *download_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -197,12 +187,10 @@ async def download_from_youtube(query: str):
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
-            logger.error(f"Download error: {stderr.decode()}")
+            logger.error(f"Download failed: {stderr.decode()}")
             return None
 
-        logger.info("Download success!")
-
-        # Cari file yang terdownload
+        # Cari file
         files = os.listdir(DOWNLOADS_DIR)
         audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
         if audio_files:
@@ -219,38 +207,6 @@ async def download_from_youtube(query: str):
         return None
 
 
-# ========== DEEZER (FALLBACK) ==========
-async def download_from_deezer(query: str):
-    """Download preview dari Deezer (fallback, 30 detik)"""
-    try:
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-        async with httpx.AsyncClient(timeout=15) as client:
-            url = f"https://api.deezer.com/search?q={query}&limit=1"
-            r = await client.get(url)
-            if r.status_code == 200:
-                data = r.json()
-                results = data.get('data', [])
-                if results:
-                    track = results[0]
-                    title = track.get('title', 'Unknown')
-                    artist = track.get('artist', {}).get('name', 'Unknown')
-                    preview_url = track.get('preview', '')
-
-                    if preview_url:
-                        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as dl_client:
-                            r = await dl_client.get(preview_url)
-                            if r.status_code == 200:
-                                file_path = os.path.join(DOWNLOADS_DIR, f"{track.get('id')}.mp3")
-                                with open(file_path, 'wb') as f:
-                                    f.write(r.content)
-                                return (file_path, f"{title} (Preview 30s)", artist)
-        return None
-    except Exception as e:
-        logger.error(f"Deezer error: {e}")
-        return None
-
-
 # ========== TELEGRAM BOT ==========
 async def run_bot():
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
@@ -260,7 +216,7 @@ async def run_bot():
     if YOUTUBE_COOKIES:
         logger.info("✅ YouTube cookies available!")
     else:
-        logger.warning("⚠️ No YouTube cookies! Will use Deezer fallback.")
+        logger.error("❌ No YouTube cookies! Set YOUTUBE_COOKIES env var!")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -278,11 +234,9 @@ async def run_bot():
 
 # ========== WEB SERVER ==========
 async def handle_index(request):
-    has_cookies = bool(YOUTUBE_COOKIES)
     return web.json_response({
         "status": "ok",
-        "bot": "running",
-        "youtube_cookies": "set" if has_cookies else "not set"
+        "cookies": "set" if YOUTUBE_COOKIES else "missing"
     })
 
 
