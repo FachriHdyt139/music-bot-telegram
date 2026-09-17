@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # Config
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
 PORT = int(os.getenv('PORT', '8080'))
+YOUTUBE_COOKIES = os.getenv('YOUTUBE_COOKIES', '')  # Isi dengan cookies dari browser
+DOWNLOADS_DIR = 'downloads'
 
 
 # ========== BOT HANDLERS ==========
@@ -23,7 +25,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎵 **Music Bot Ready!**\n\n"
         "Ketik: `/p judul lagu`\n"
-        "Contoh: `/p sampai jumpa`",
+        "Contoh: `/p sampai jumpa`\n\n"
+        "Full durasi, bukan preview!",
         parse_mode='Markdown'
     )
 
@@ -39,17 +42,21 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
     if not query:
-        await update.message.reply_text(
-            "⚠️ **Ketik: `/p judul lagu`**",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("⚠️ **Ketik: `/p judul lagu`**", parse_mode='Markdown')
         return
 
     loading = await update.message.reply_text(f"🔍 **Mencari:** {query}...")
 
     try:
         logger.info(f"Search: {query}")
-        result = await search_and_download(query)
+
+        # Coba YouTube dulu (full durasi)
+        result = await download_from_youtube(query)
+
+        # Kalau YouTube gagal, fallback ke Deezer (30 detik)
+        if not result:
+            logger.info("YouTube failed, trying Deezer...")
+            result = await download_from_deezer(query)
 
         if result:
             audio_path, title, artist = result
@@ -63,9 +70,6 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 with open(audio_path, 'rb') as audio:
-                    caption = f"🎵 {title}"
-                    if artist:
-                        caption += f"\n👤 {artist}"
                     await update.message.reply_audio(
                         audio=audio,
                         title=title[:100],
@@ -94,68 +98,136 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 
-# ========== DEEZER API ==========
-async def search_deezer(query: str):
-    """Cari lagu di Deezer API (gratis, gak perlu API key)"""
-    async with httpx.AsyncClient(timeout=15) as client:
+# ========== YOUTUBE (FULL DURASI) ==========
+def setup_cookies_file():
+    """Setup cookies file dari environment variable"""
+    if YOUTUBE_COOKIES:
+        cookies_path = os.path.join(DOWNLOADS_DIR, 'cookies.txt')
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+        # Decode base64 cookies jika perlu
+        import base64
         try:
-            url = f"https://api.deezer.com/search?q={query}&limit=5"
+            # Coba decode base64 dulu
+            decoded = base64.b64decode(YOUTUBE_COOKIES).decode('utf-8')
+            with open(cookies_path, 'w') as f:
+                f.write(decoded)
+            logger.info("Cookies loaded from base64")
+        except Exception:
+            # Kalau bukan base64, tulis langsung
+            with open(cookies_path, 'w') as f:
+                f.write(YOUTUBE_COOKIES)
+            logger.info("Cookies loaded directly")
+
+        return cookies_path
+    return None
+
+
+async def download_from_youtube(query: str):
+    """Download audio dari YouTube pakai yt-dlp + cookies"""
+    try:
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+        # Bersihin file lama
+        for f in os.listdir(DOWNLOADS_DIR):
+            fp = os.path.join(DOWNLOADS_DIR, f)
+            if os.path.isfile(fp) and not f.endswith('.txt'):
+                os.remove(fp)
+
+        # Setup cookies
+        cookies_path = setup_cookies_file()
+
+        # Build yt-dlp command
+        cmd = [
+            'yt-dlp',
+            '-f', 'bestaudio[ext=m4a]/bestaudio',
+            '--extractor-args', 'youtube:player_client=ios,web',
+            '--no-playlist',
+            '--no-warnings',
+            '--no-overwrites',
+            '-o', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
+        ]
+
+        # Tambah cookies kalau ada
+        if cookies_path and os.path.exists(cookies_path):
+            cmd.extend(['--cookies', cookies_path])
+            logger.info("Using cookies for YouTube")
+        else:
+            logger.warning("No cookies available, YouTube might fail")
+
+        cmd.append(f'ytsearch1:{query}')
+
+        logger.info(f"Running yt-dlp...")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            error_msg = stderr.decode()
+            logger.error(f"yt-dlp error: {error_msg}")
+
+            # Jika error cookies, kasih info
+            if 'Sign in' in error_msg or 'bot' in error_msg.lower():
+                logger.error("YouTube blocking! Need valid cookies!")
+
+            return None
+
+        logger.info(f"yt-dlp success!")
+
+        # Cari file yang terdownload
+        files = os.listdir(DOWNLOADS_DIR)
+        if files:
+            audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
+            if audio_files:
+                latest = max(
+                    [os.path.join(DOWNLOADS_DIR, f) for f in audio_files],
+                    key=os.path.getmtime
+                )
+                # Get title from filename
+                title = os.path.basename(latest).rsplit('.', 1)[0]
+                return (latest, query, "YouTube")
+
+        return None
+
+    except Exception as e:
+        logger.error(f"YouTube error: {e}", exc_info=True)
+        return None
+
+
+# ========== DEEZER (FALLBACK) ==========
+async def download_from_deezer(query: str):
+    """Download preview dari Deezer (fallback, 30 detik)"""
+    try:
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            url = f"https://api.deezer.com/search?q={query}&limit=1"
             r = await client.get(url)
             if r.status_code == 200:
                 data = r.json()
                 results = data.get('data', [])
                 if results:
-                    return results
-        except Exception as e:
-            logger.error(f"Deezer search error: {e}")
-    return None
+                    track = results[0]
+                    title = track.get('title', 'Unknown')
+                    artist = track.get('artist', {}).get('name', 'Unknown')
+                    preview_url = track.get('preview', '')
 
-
-async def search_and_download(query: str):
-    """Cari & download audio dari Deezer"""
-    try:
-        os.makedirs('downloads', exist_ok=True)
-
-        # Bersihin file lama
-        for f in os.listdir('downloads'):
-            fp = os.path.join('downloads', f)
-            if os.path.isfile(fp):
-                os.remove(fp)
-
-        # Cari di Deezer
-        results = await search_deezer(query)
-        if not results:
-            return None
-
-        # Ambil yang paling cocok
-        track = results[0]
-        title = track.get('title', 'Unknown')
-        artist = track.get('artist', {}).get('name', 'Unknown')
-        preview_url = track.get('preview', '')
-
-        if not preview_url:
-            logger.error("No preview URL found")
-            return None
-
-        logger.info(f"Found: {title} - {artist}")
-        logger.info(f"Preview URL: {preview_url[:80]}...")
-
-        # Download preview (30 detik)
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.get(preview_url)
-            if r.status_code == 200:
-                file_path = os.path.join('downloads', f"{track.get('id')}.mp3")
-                with open(file_path, 'wb') as f:
-                    f.write(r.content)
-                logger.info(f"Saved: {file_path}")
-                return (file_path, title, artist)
-            else:
-                logger.error(f"Download failed: {r.status_code}")
-
+                    if preview_url:
+                        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as dl_client:
+                            r = await dl_client.get(preview_url)
+                            if r.status_code == 200:
+                                file_path = os.path.join(DOWNLOADS_DIR, f"{track.get('id')}.mp3")
+                                with open(file_path, 'wb') as f:
+                                    f.write(r.content)
+                                return (file_path, f"{title} (Preview)", artist)
         return None
-
     except Exception as e:
-        logger.error(f"Search/download error: {e}", exc_info=True)
+        logger.error(f"Deezer error: {e}")
         return None
 
 
@@ -164,6 +236,13 @@ async def run_bot():
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
         logger.error("BOT_TOKEN belum diisi!")
         return
+
+    # Setup cookies
+    if YOUTUBE_COOKIES:
+        logger.info("YouTube cookies available!")
+    else:
+        logger.warning("No YouTube cookies! YouTube downloads may fail.")
+        logger.warning("Set YOUTUBE_COOKIES env var for full duration songs.")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -181,7 +260,12 @@ async def run_bot():
 
 # ========== WEB SERVER ==========
 async def handle_index(request):
-    return web.json_response({"status": "ok", "bot": "running"})
+    has_cookies = bool(YOUTUBE_COOKIES)
+    return web.json_response({
+        "status": "ok",
+        "bot": "running",
+        "youtube_cookies": "set" if has_cookies else "not set"
+    })
 
 
 async def handle_health(request):
