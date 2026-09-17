@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import base64
 import httpx
 from aiohttp import web
 from telegram import Update
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 # Config
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
 PORT = int(os.getenv('PORT', '8080'))
-YOUTUBE_COOKIES = os.getenv('YOUTUBE_COOKIES', '')  # Isi dengan cookies dari browser
+YOUTUBE_COOKIES = os.getenv('YOUTUBE_COOKIES', '')
 DOWNLOADS_DIR = 'downloads'
 
 
@@ -26,7 +27,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎵 **Music Bot Ready!**\n\n"
         "Ketik: `/p judul lagu`\n"
         "Contoh: `/p sampai jumpa`\n\n"
-        "Full durasi, bukan preview!",
+        "Full durasi! 🎧",
         parse_mode='Markdown'
     )
 
@@ -101,96 +102,115 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== YOUTUBE (FULL DURASI) ==========
 def setup_cookies_file():
     """Setup cookies file dari environment variable"""
-    if YOUTUBE_COOKIES:
-        cookies_path = os.path.join(DOWNLOADS_DIR, 'cookies.txt')
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    if not YOUTUBE_COOKIES:
+        return None
 
-        # Decode base64 cookies jika perlu
-        import base64
-        try:
-            # Coba decode base64 dulu
-            decoded = base64.b64decode(YOUTUBE_COOKIES).decode('utf-8')
-            with open(cookies_path, 'w') as f:
-                f.write(decoded)
-            logger.info("Cookies loaded from base64")
-        except Exception:
-            # Kalau bukan base64, tulis langsung
-            with open(cookies_path, 'w') as f:
-                f.write(YOUTUBE_COOKIES)
-            logger.info("Cookies loaded directly")
+    cookies_path = os.path.join(DOWNLOADS_DIR, 'cookies.txt')
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-        return cookies_path
-    return None
+    try:
+        decoded = base64.b64decode(YOUTUBE_COOKIES).decode('utf-8')
+        with open(cookies_path, 'w') as f:
+            f.write(decoded)
+        logger.info("Cookies loaded from base64")
+    except Exception:
+        with open(cookies_path, 'w') as f:
+            f.write(YOUTUBE_COOKIES)
+        logger.info("Cookies loaded directly")
+
+    return cookies_path
 
 
 async def download_from_youtube(query: str):
-    """Download audio dari YouTube pakai yt-dlp + cookies"""
+    """Download audio dari YouTube pakai yt-dlp + cookies + node runtime"""
     try:
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-        # Bersihin file lama
         for f in os.listdir(DOWNLOADS_DIR):
             fp = os.path.join(DOWNLOADS_DIR, f)
             if os.path.isfile(fp) and not f.endswith('.txt'):
                 os.remove(fp)
 
-        # Setup cookies
         cookies_path = setup_cookies_file()
 
-        # Build yt-dlp command
-        cmd = [
+        if not cookies_path or not os.path.exists(cookies_path):
+            logger.error("No cookies available!")
+            return None
+
+        # Step 1: Search untuk dapat video ID
+        search_cmd = [
             'yt-dlp',
-            '-f', 'bestaudio[ext=m4a]/bestaudio',
-            '--extractor-args', 'youtube:player_client=ios,web',
+            '--js-runtimes', 'node',
+            '--cookies', cookies_path,
+            '--extractor-args', 'youtube:player_client=web',
+            '--flat-playlist',
+            '--print', '%(id)s|||%(title)s',
+            f'ytsearch1:{query}'
+        ]
+
+        logger.info("Searching YouTube...")
+        process = await asyncio.create_subprocess_exec(
+            *search_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            logger.error(f"Search error: {stderr.decode()}")
+            return None
+
+        output = stdout.decode().strip()
+        if not output:
+            logger.error("No search results")
+            return None
+
+        # Parse video ID dan title
+        parts = output.split('|||')
+        video_id = parts[0].strip()
+        title = parts[1].strip() if len(parts) > 1 else query
+
+        logger.info(f"Found: {title} (ID: {video_id})")
+
+        # Step 2: Download audio
+        download_cmd = [
+            'yt-dlp',
+            '--js-runtimes', 'node',
+            '--cookies', cookies_path,
+            '--extractor-args', 'youtube:player_client=web',
+            '--extract-audio',
+            '--audio-format', 'mp3',
+            '--audio-quality', '5',
             '--no-playlist',
             '--no-warnings',
             '--no-overwrites',
             '-o', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
+            f'https://www.youtube.com/watch?v={video_id}'
         ]
 
-        # Tambah cookies kalau ada
-        if cookies_path and os.path.exists(cookies_path):
-            cmd.extend(['--cookies', cookies_path])
-            logger.info("Using cookies for YouTube")
-        else:
-            logger.warning("No cookies available, YouTube might fail")
-
-        cmd.append(f'ytsearch1:{query}')
-
-        logger.info(f"Running yt-dlp...")
-
+        logger.info("Downloading audio...")
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *download_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-
         stdout, stderr = await process.communicate()
 
         if process.returncode != 0:
-            error_msg = stderr.decode()
-            logger.error(f"yt-dlp error: {error_msg}")
-
-            # Jika error cookies, kasih info
-            if 'Sign in' in error_msg or 'bot' in error_msg.lower():
-                logger.error("YouTube blocking! Need valid cookies!")
-
+            logger.error(f"Download error: {stderr.decode()}")
             return None
 
-        logger.info(f"yt-dlp success!")
+        logger.info("Download success!")
 
         # Cari file yang terdownload
         files = os.listdir(DOWNLOADS_DIR)
-        if files:
-            audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
-            if audio_files:
-                latest = max(
-                    [os.path.join(DOWNLOADS_DIR, f) for f in audio_files],
-                    key=os.path.getmtime
-                )
-                # Get title from filename
-                title = os.path.basename(latest).rsplit('.', 1)[0]
-                return (latest, query, "YouTube")
+        audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
+        if audio_files:
+            latest = max(
+                [os.path.join(DOWNLOADS_DIR, f) for f in audio_files],
+                key=os.path.getmtime
+            )
+            return (latest, title, "YouTube")
 
         return None
 
@@ -224,7 +244,7 @@ async def download_from_deezer(query: str):
                                 file_path = os.path.join(DOWNLOADS_DIR, f"{track.get('id')}.mp3")
                                 with open(file_path, 'wb') as f:
                                     f.write(r.content)
-                                return (file_path, f"{title} (Preview)", artist)
+                                return (file_path, f"{title} (Preview 30s)", artist)
         return None
     except Exception as e:
         logger.error(f"Deezer error: {e}")
@@ -237,12 +257,10 @@ async def run_bot():
         logger.error("BOT_TOKEN belum diisi!")
         return
 
-    # Setup cookies
     if YOUTUBE_COOKIES:
-        logger.info("YouTube cookies available!")
+        logger.info("✅ YouTube cookies available!")
     else:
-        logger.warning("No YouTube cookies! YouTube downloads may fail.")
-        logger.warning("Set YOUTUBE_COOKIES env var for full duration songs.")
+        logger.warning("⚠️ No YouTube cookies! Will use Deezer fallback.")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
