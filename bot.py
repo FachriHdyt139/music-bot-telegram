@@ -1,26 +1,23 @@
 import os
 import logging
 import asyncio
-import base64
+import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Config
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
 PORT = int(os.getenv('PORT', '8080'))
-YOUTUBE_COOKIES = os.getenv('YOUTUBE_COOKIES', '')
+RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '2be0c6b79emsh877b9588fd0d1a9p1f7a12jsnec208cb78e35')
 DOWNLOADS_DIR = 'downloads'
 
 
-# ========== BOT HANDLERS ==========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎵 **Music Bot Ready!**\n\n"
@@ -49,31 +46,33 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         logger.info(f"Search: {query}")
-        result = await download_from_youtube(query)
 
+        video_id, title = await search_youtube(query)
+        if not video_id:
+            await loading.edit_text("❌ **Lagu tidak ditemukan!** Coba judul lain.")
+            return
+
+        logger.info(f"Found: {title} (ID: {video_id})")
+        await loading.edit_text(f"📥 **Download:** {title}...")
+
+        result = await download_via_rapidapi(video_id, title)
         if result:
-            audio_path, title, artist = result
-            if os.path.exists(audio_path):
-                file_size = os.path.getsize(audio_path)
-                logger.info(f"Downloaded: {file_size} bytes")
-
-                if file_size < 1000:
-                    os.remove(audio_path)
-                    await loading.edit_text("❌ **Gagal!** Coba judul lain.")
-                    return
-
+            audio_path, song_title = result
+            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
                 with open(audio_path, 'rb') as audio:
                     await update.message.reply_audio(
                         audio=audio,
-                        title=title[:100],
-                        performer=artist or "YouTube"
+                        title=song_title[:100],
+                        performer="YouTube"
                     )
                 os.remove(audio_path)
-                await loading.edit_text(f"✅ **{title}**")
+                await loading.edit_text(f"✅ **{song_title}**")
             else:
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
                 await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
         else:
-            await loading.edit_text("❌ **Gagal!** Pastikan cookies valid.")
+            await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await loading.edit_text("❌ **Error!** Coba lagi.")
@@ -91,132 +90,113 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 
-# ========== YOUTUBE DOWNLOAD ==========
-def setup_cookies_file():
-    """Setup cookies file dari environment variable"""
-    if not YOUTUBE_COOKIES:
-        return None
+async def search_youtube(query: str):
+    """Search YouTube via Invidious API, return (video_id, title)"""
+    instances = [
+        "https://inv.nadeko.net",
+        "https://invidious.protokolla.fi",
+        "https://invidious.privacyredirect.com",
+        "https://vid.puffyan.us",
+        "https://yt.artemislena.eu",
+    ]
 
-    cookies_path = os.path.join(DOWNLOADS_DIR, 'cookies.txt')
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        for instance in instances:
+            try:
+                url = f"{instance}/api/v1/search"
+                r = await client.get(url, params={"q": query, "type": "video", "sort_by": "relevance"})
+                if r.status_code == 200:
+                    results = r.json()
+                    for item in results:
+                        if item.get('type') == 'video' and item.get('videoId'):
+                            return item['videoId'], item.get('title', query)
+            except Exception as e:
+                logger.warning(f"Invidious {instance} failed: {e}")
+                continue
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            url = "https://www.youtube.com/results"
+            r = await client.get(url, params={"search_query": query, "sp": "EgIQAQ%3D%3D"})
+            if r.status_code == 200:
+                text = r.text
+                idx = text.find('"videoId":"')
+                if idx > 0:
+                    start = idx + 11
+                    end = text.find('"', start)
+                    video_id = text[start:end]
+
+                    tidx = text.find('"title":{"runs":[{"text":"', start)
+                    if tidx > 0:
+                        tstart = tidx + 26
+                        tend = text.find('"', tstart)
+                        title = text[tstart:tend]
+                    else:
+                        title = query
+
+                    return video_id, title
+    except Exception as e:
+        logger.error(f"YouTube search failed: {e}")
+
+    return None, None
+
+
+async def download_via_rapidapi(video_id: str, title: str):
+    """Download MP3 via RapidAPI YouTube MP3"""
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
     try:
-        decoded = base64.b64decode(YOUTUBE_COOKIES).decode('utf-8')
-        with open(cookies_path, 'w') as f:
-            f.write(decoded)
-        logger.info("Cookies loaded from base64")
-    except Exception:
-        with open(cookies_path, 'w') as f:
-            f.write(YOUTUBE_COOKIES)
-        logger.info("Cookies loaded directly")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            url = "https://youtube-mp36.p.rapidapi.com/dl"
+            headers = {
+                "Content-Type": "application/json",
+                "x-rapidapi-host": "youtube-mp36.p.rapidapi.com",
+                "x-rapidapi-key": RAPIDAPI_KEY
+            }
 
-    return cookies_path
+            r = await client.get(url, headers=headers, params={"id": video_id})
+            logger.info(f"RapidAPI response: {r.status_code}")
 
+            if r.status_code != 200:
+                logger.error(f"RapidAPI error: {r.text[:200]}")
+                return None
 
-async def download_from_youtube(query: str):
-    """Download audio dari YouTube pakai yt-dlp + cookies + node"""
-    try:
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+            data = r.json()
+            logger.info(f"RapidAPI data: {data}")
 
-        # Bersihin file lama
-        for f in os.listdir(DOWNLOADS_DIR):
-            fp = os.path.join(DOWNLOADS_DIR, f)
-            if os.path.isfile(fp) and not f.endswith('.txt'):
-                os.remove(fp)
+            if data.get('status') == 'ok':
+                download_url = data.get('link')
+                if not download_url:
+                    logger.error("No download link in response")
+                    return None
 
-        cookies_path = setup_cookies_file()
-        if not cookies_path:
-            logger.error("No cookies! Set YOUTUBE_COOKIES env var.")
-            return None
+                safe_title = data.get('title', title).replace('/', '-').replace('\\', '-')[:80]
+                file_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.mp3")
 
-        # Cari video ID dulu
-        search_cmd = [
-            'yt-dlp',
-            '--js-runtimes', 'node',
-            '--cookies', cookies_path,
-            '--extractor-args', 'youtube:player_client=web',
-            '--flat-playlist',
-            '--print', '%(id)s|||%(title)s',
-            f'ytsearch1:{query}'
-        ]
-
-        logger.info("Searching YouTube...")
-        process = await asyncio.create_subprocess_exec(
-            *search_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            logger.error(f"Search failed: {stderr.decode()}")
-            return None
-
-        output = stdout.decode().strip()
-        if not output:
-            return None
-
-        parts = output.split('|||')
-        video_id = parts[0].strip()
-        title = parts[1].strip() if len(parts) > 1 else query
-
-        logger.info(f"Found: {title} (ID: {video_id})")
-
-        # Download audio
-        download_cmd = [
-            'yt-dlp',
-            '--js-runtimes', 'node',
-            '--cookies', cookies_path,
-            '--extractor-args', 'youtube:player_client=web',
-            '--extract-audio',
-            '--audio-format', 'mp3',
-            '--audio-quality', '5',
-            '--no-playlist',
-            '--no-warnings',
-            '--no-overwrites',
-            '-o', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
-            f'https://www.youtube.com/watch?v={video_id}'
-        ]
-
-        logger.info("Downloading...")
-        process = await asyncio.create_subprocess_exec(
-            *download_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            logger.error(f"Download failed: {stderr.decode()}")
-            return None
-
-        # Cari file
-        files = os.listdir(DOWNLOADS_DIR)
-        audio_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
-        if audio_files:
-            latest = max(
-                [os.path.join(DOWNLOADS_DIR, f) for f in audio_files],
-                key=os.path.getmtime
-            )
-            return (latest, title, "YouTube")
-
-        return None
+                r2 = await client.get(download_url)
+                if r2.status_code == 200:
+                    with open(file_path, 'wb') as f:
+                        f.write(r2.content)
+                    logger.info(f"Downloaded: {os.path.getsize(file_path)} bytes")
+                    return (file_path, safe_title)
+                else:
+                    logger.error(f"Download failed: {r2.status_code}")
+                    return None
+            else:
+                logger.error(f"RapidAPI status not ok: {data}")
+                return None
 
     except Exception as e:
-        logger.error(f"YouTube error: {e}", exc_info=True)
+        logger.error(f"RapidAPI error: {e}", exc_info=True)
         return None
 
 
-# ========== TELEGRAM BOT ==========
 async def run_bot():
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
         logger.error("BOT_TOKEN belum diisi!")
         return
 
-    if YOUTUBE_COOKIES:
-        logger.info("✅ YouTube cookies available!")
-    else:
-        logger.error("❌ No YouTube cookies! Set YOUTUBE_COOKIES env var!")
+    logger.info(f"RapidAPI key: {'SET' if RAPIDAPI_KEY else 'MISSING'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -228,16 +208,11 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("✅ Bot started!")
-
     await asyncio.Event().wait()
 
 
-# ========== WEB SERVER ==========
 async def handle_index(request):
-    return web.json_response({
-        "status": "ok",
-        "cookies": "set" if YOUTUBE_COOKIES else "missing"
-    })
+    return web.json_response({"status": "ok", "engine": "rapidapi"})
 
 
 async def handle_health(request):
@@ -248,19 +223,16 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_index)
     app.router.add_get('/healthcheck', handle_health)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logger.info(f"✅ Web server on port {PORT}")
-
     await asyncio.Event().wait()
 
 
-# ========== MAIN ==========
 async def main():
-    logger.info("Starting...")
+    logger.info("Starting with RapidAPI engine...")
     await asyncio.gather(
         run_bot(),
         start_web_server()
