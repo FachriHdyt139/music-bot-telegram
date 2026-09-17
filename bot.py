@@ -1,7 +1,9 @@
 import os
 import logging
+import asyncio
 import httpx
-from aiohttp import web
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -14,30 +16,28 @@ logger = logging.getLogger(__name__)
 
 # Config
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
-RENDER_URL = os.getenv('RENDER_EXTERNAL_URL', '')
 PORT = int(os.getenv('PORT', '8080'))
 DOWNLOADS_DIR = 'downloads'
 
-# Piped API instances
+# Piped API
 PIPED_INSTANCES = [
     'https://pipedapi.kavin.rocks',
     'https://piped-api.privacy.com.de',
     'https://api.piped.yt',
 ]
 
+# Global bot app
+telegram_app: Application = None
 
-# ========== BOT HANDLERS ==========
+
+# ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    welcome_msg = (
-        "🎵 **Halo! Gue Music Bot!** 🎵\n\n"
-        "Cara pake gue gampang banget:\n"
-        "Ketik: `/p judul lagu`\n\n"
-        "**Contoh:**\n"
-        "• `/p sampai jumpa`\n"
-        "• `/p dj tiktok viral 2024`\n\n"
-        "Gue bakal cariin lagunya terus kirim file mp3-nya! 🎧"
+    await update.message.reply_text(
+        "🎵 **Music Bot Ready!** 🎵\n\n"
+        "Ketik: `/p judul lagu`\n"
+        "Contoh: `/p sampai jumpa`",
+        parse_mode='Markdown'
     )
-    await update.message.reply_text(welcome_msg, parse_mode='Markdown')
 
 
 async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50,81 +50,53 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return
     else:
-        await update.message.reply_text(
-            "⚠️ **Lagu apa yang mau diputar?**\nKetik: `/p judul lagu`",
-            parse_mode='Markdown'
-        )
         return
 
     if not query:
         return
 
-    loading_msg = await update.message.reply_text(
-        f"🔍 **Mencari:** {query}... ⏳",
-        parse_mode='Markdown'
-    )
+    loading = await update.message.reply_text(f"🔍 Mencari: {query}...")
 
     try:
         audio_path = await download_audio(query)
-
         if audio_path and os.path.exists(audio_path):
-            file_size = os.path.getsize(audio_path)
-            if file_size > 50 * 1024 * 1024:
-                await loading_msg.edit_text("❌ **File terlalu besar!** Coba judul lain.", parse_mode='Markdown')
-                os.remove(audio_path)
-                return
-
-            with open(audio_path, 'rb') as audio:
-                await update.message.reply_audio(
-                    audio=audio,
-                    title=query[:100],
-                    performer="YouTube Audio"
-                )
-
+            with open(audio_path, 'rb') as f:
+                await update.message.reply_audio(audio=f, title=query[:100])
             os.remove(audio_path)
-            await loading_msg.edit_text("✅ **Berhasil!** 🎉", parse_mode='Markdown')
+            await loading.edit_text("✅ Berhasil!")
         else:
-            await loading_msg.edit_text("❌ **Gagal download!** Coba judul lain.", parse_mode='Markdown')
-
+            await loading.edit_text("❌ Gagal! Coba judul lain.")
     except Exception as e:
         logger.error(f"Error: {e}")
-        await loading_msg.edit_text("❌ **Error!** Coba lagi nanti.", parse_mode='Markdown')
+        await loading.edit_text("❌ Error!")
 
 
 async def search_youtube(query: str):
     async with httpx.AsyncClient(timeout=30) as client:
-        for instance in PIPED_INSTANCES:
+        for inst in PIPED_INSTANCES:
             try:
-                url = f"{instance}/search"
-                params = {'q': query, 'filter': 'music_songs'}
-                response = await client.get(url, params=params)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data and len(data) > 0:
-                        video = data[0]
-                        video_url = video.get('url', '')
-                        video_id = video_url.split('v=')[-1] if 'v=' in video_url else video_url
-                        return {'id': video_id, 'title': video.get('title', 'Unknown')}
-            except Exception as e:
-                logger.warning(f"Piped {instance} failed: {e}")
+                r = await client.get(f"{inst}/search", params={'q': query, 'filter': 'music_songs'})
+                if r.status_code == 200:
+                    data = r.json()
+                    if data:
+                        v = data[0]
+                        vid = v.get('url', '').split('v=')[-1]
+                        return {'id': vid, 'title': v.get('title', '')}
+            except:
                 continue
     return None
 
 
 async def get_audio_url(video_id: str):
     async with httpx.AsyncClient(timeout=30) as client:
-        for instance in PIPED_INSTANCES:
+        for inst in PIPED_INSTANCES:
             try:
-                url = f"{instance}/streams/{video_id}"
-                response = await client.get(url)
-                if response.status_code == 200:
-                    data = response.json()
-                    streams = data.get('audioStreams', [])
+                r = await client.get(f"{inst}/streams/{video_id}")
+                if r.status_code == 200:
+                    streams = r.json().get('audioStreams', [])
                     if streams:
-                        best = max(streams, key=lambda x: x.get('bitrate', 0))
-                        return best.get('url')
-            except Exception as e:
-                logger.warning(f"Piped {instance} failed: {e}")
+                        return max(streams, key=lambda x: x.get('bitrate', 0)).get('url')
+            except:
                 continue
     return None
 
@@ -132,11 +104,8 @@ async def get_audio_url(video_id: str):
 async def download_audio(query: str):
     try:
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
         for f in os.listdir(DOWNLOADS_DIR):
-            fp = os.path.join(DOWNLOADS_DIR, f)
-            if os.path.isfile(fp):
-                os.remove(fp)
+            os.remove(os.path.join(DOWNLOADS_DIR, f))
 
         video = await search_youtube(query)
         if not video:
@@ -147,89 +116,64 @@ async def download_audio(query: str):
             return None
 
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            response = await client.get(audio_url)
-            if response.status_code == 200:
-                ct = response.headers.get('content-type', '')
+            r = await client.get(audio_url)
+            if r.status_code == 200:
+                ct = r.headers.get('content-type', '')
                 ext = 'webm' if 'webm' in ct else 'm4a'
-                file_path = os.path.join(DOWNLOADS_DIR, f"{video['id']}.{ext}")
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
-                return file_path
+                path = os.path.join(DOWNLOADS_DIR, f"{video['id']}.{ext}")
+                with open(path, 'wb') as f:
+                    f.write(r.content)
+                return path
         return None
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
 
 
-# ========== WEB SERVER ==========
-async def handle_webhook(request):
-    """Handle webhook updates dari Telegram"""
-    app = request.app
-    bot_app = app['bot_app']
+# ========== FASTAPI ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global telegram_app
     
-    try:
-        data = await request.json()
-        update = Update.de_json(data, bot_app.bot)
-        await bot_app.process_update(update)
-        return web.Response(text='OK')
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return web.Response(text='ERROR', status=500)
-
-
-async def health_check(request):
-    return web.json_response({"status": "ok"})
-
-
-async def on_startup(app):
-    """Setup webhook saat server mulai"""
-    bot_app = app['bot_app']
-    
-    # Set webhook ke Telegram
-    webhook_url = f"{RENDER_URL}/webhook"
-    await bot_app.bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
-
-
-async def on_cleanup(app):
-    """Cleanup saat server stop"""
-    bot_app = app['bot_app']
-    await bot_app.bot.delete_webhook()
-    await bot_app.shutdown()
-
-
-def main():
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
-        print("❌ ERROR: Token bot belum diisi!")
+        logger.error("BOT_TOKEN belum diisi!")
+        yield
         return
 
-    if not RENDER_URL:
-        print("❌ ERROR: RENDER_EXTERNAL_URL belum diisi!")
-        print("Pastikan service di-set ke Web Service di Render!")
-        return
+    # Build & init bot
+    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("p", search_and_send))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_and_send))
+    
+    await telegram_app.initialize()
+    await telegram_app.start()
+    
+    # Start polling
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Bot started with polling!")
+    
+    yield
+    
+    # Shutdown
+    await telegram_app.updater.stop()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
 
-    # Build bot application
-    bot_app = Application.builder().token(BOT_TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("p", search_and_send))
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_and_send))
 
-    # Build web server
-    web_app = web.Application()
-    web_app['bot_app'] = bot_app
-    web_app.router.add_post('/webhook', handle_webhook)
-    web_app.router.add_get('/', health_check)
-    web_app.router.add_get('/health', health_check)
-    web_app.on_startup.append(on_startup)
-    web_app.on_cleanup.append(on_cleanup)
+fastapi_app = FastAPI(lifespan=lifespan)
 
-    print("🤖 Bot Musik Mulai Jalan! 🎵")
-    print(f"Webhook: {RENDER_URL}/webhook")
-    print(f"Health: {RENDER_URL}/")
 
-    # Jalankan web server (ini juga handle bot via webhook)
-    web.run_app(web_app, host='0.0.0.0', port=PORT)
+@fastapi_app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+@fastapi_app.get("/healthcheck")
+async def healthcheck():
+    return {"status": "healthy"}
 
 
 if __name__ == '__main__':
-    main()
+    import uvicorn
+    uvicorn.run(fastapi_app, host='0.0.0.0', port=PORT)
