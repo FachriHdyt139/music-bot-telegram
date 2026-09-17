@@ -127,18 +127,23 @@ async def download_audio(query: str) -> str:
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
+        # User agent buat bypass bot detection
+        user_agent = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36'
+
         # Command yt-dlp buat download audio
         cmd = [
             'yt-dlp',
             '--extract-audio',
             '--audio-format', 'mp3',
-            '--audio-quality', '5',  # Quality medium (hemat kuota)
-            '--max-filesize', '50M',  # Max 50MB
-            '--no-playlist',  # Jangan download playlist
-            '--no-warnings',  # Minimize warnings
-            '--quiet',  # Quiet mode
-            '--no-overwrites',  # Jangan timpa file
-            '--default-search', 'ytsearch1:',  # Cari di YouTube, ambil 1 hasil
+            '--audio-quality', '5',
+            '--max-filesize', '50M',
+            '--no-playlist',
+            '--no-warnings',
+            '--quiet',
+            '--no-overwrites',
+            '--user-agent', user_agent,
+            '--extractor-args', 'youtube:player_client=mweb,web',
+            '--default-search', 'ytsearch1:',
             '--output', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
             f'ytsearch1:{query}'
         ]
@@ -152,9 +157,37 @@ async def download_audio(query: str) -> str:
 
         stdout, stderr = await process.communicate()
 
+        # Kalau gagal, coba dengan player_client lain
         if process.returncode != 0:
-            logger.error(f"yt-dlp error: {stderr.decode()}")
-            return None
+            logger.warning("First attempt failed, trying with different player client...")
+            cmd_fallback = [
+                'yt-dlp',
+                '--extract-audio',
+                '--audio-format', 'mp3',
+                '--audio-quality', '5',
+                '--max-filesize', '50M',
+                '--no-playlist',
+                '--no-warnings',
+                '--quiet',
+                '--no-overwrites',
+                '--user-agent', user_agent,
+                '--extractor-args', 'youtube:player_client=tv',
+                '--default-search', 'ytsearch1:',
+                '--output', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
+                f'ytsearch1:{query}'
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd_fallback,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                logger.error(f"yt-dlp error: {stderr.decode()}")
+                return None
 
         # Cari file yang baru di-download
         files = os.listdir(DOWNLOADS_DIR)
