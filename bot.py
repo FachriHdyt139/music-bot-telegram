@@ -2,8 +2,7 @@ import os
 import logging
 import asyncio
 import httpx
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -26,33 +25,27 @@ PIPED_INSTANCES = [
     'https://api.piped.yt',
 ]
 
-# Global bot app
-telegram_app: Application = None
 
-
-# ========== HANDLERS ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ========== BOT HANDLERS ==========
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎵 **Music Bot Ready!** 🎵\n\n"
+        "🎵 **Music Bot Ready!**\n\n"
         "Ketik: `/p judul lagu`\n"
         "Contoh: `/p sampai jumpa`",
         parse_mode='Markdown'
     )
 
 
-async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        query = ' '.join(context.args)
-    elif update.message and update.message.text:
+async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = ' '.join(context.args) if context.args else None
+    
+    if not query and update.message and update.message.text:
         text = update.message.text
         if text.lower().startswith('.p '):
             query = text[3:].strip()
-        else:
-            return
-    else:
-        return
 
     if not query:
+        await update.message.reply_text("⚠️ Ketik: `/p judul lagu`", parse_mode='Markdown')
         return
 
     loading = await update.message.reply_text(f"🔍 Mencari: {query}...")
@@ -69,6 +62,15 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error: {e}")
         await loading.edit_text("❌ Error!")
+
+
+async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text:
+        text = update.message.text
+        if text.lower().startswith('.p '):
+            query = text[3:].strip()
+            if query:
+                await cmd_play(update, context)
 
 
 async def search_youtube(query: str):
@@ -130,50 +132,63 @@ async def download_audio(query: str):
         return None
 
 
-# ========== FASTAPI ==========
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global telegram_app
-    
+# ========== TELEGRAM BOT RUNNER ==========
+async def run_bot():
+    """Jalanin Telegram bot"""
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
         logger.error("BOT_TOKEN belum diisi!")
-        yield
         return
 
-    # Build & init bot
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("p", search_and_send))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_and_send))
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("p", cmd_play))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("✅ Telegram bot started!")
+
+    # Keep running
+    await asyncio.Event().wait()
+
+
+# ========== WEB SERVER ==========
+async def handle_index(request):
+    return web.json_response({"status": "ok", "bot": "running"})
+
+
+async def handle_health(request):
+    return web.json_response({"status": "healthy"})
+
+
+async def start_web_server():
+    """Jalanin web server buat health check"""
+    app = web.Application()
+    app.router.add_get('/', handle_index)
+    app.router.add_get('/healthcheck', handle_health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"✅ Web server started on port {PORT}")
+
+    # Keep running
+    await asyncio.Event().wait()
+
+
+# ========== MAIN ==========
+async def main():
+    """Jalanin bot + web server bareng"""
+    logger.info("Starting bot and web server...")
     
-    await telegram_app.initialize()
-    await telegram_app.start()
-    
-    # Start polling
-    await telegram_app.updater.start_polling(drop_pending_updates=True)
-    logger.info("Bot started with polling!")
-    
-    yield
-    
-    # Shutdown
-    await telegram_app.updater.stop()
-    await telegram_app.stop()
-    await telegram_app.shutdown()
-
-
-fastapi_app = FastAPI(lifespan=lifespan)
-
-
-@fastapi_app.get("/")
-async def root():
-    return {"status": "ok"}
-
-
-@fastapi_app.get("/healthcheck")
-async def healthcheck():
-    return {"status": "healthy"}
+    # Run both concurrently
+    await asyncio.gather(
+        run_bot(),
+        start_web_server()
+    )
 
 
 if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(fastapi_app, host='0.0.0.0', port=PORT)
+    asyncio.run(main())
