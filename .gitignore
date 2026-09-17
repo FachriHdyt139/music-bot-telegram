@@ -1,0 +1,23 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Downloads folder (temporary)
+downloads/
+
+# Environment variables (RAHASIA!)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
