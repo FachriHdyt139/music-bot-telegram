@@ -1,7 +1,9 @@
 import os
 import logging
 import asyncio
+import threading
 import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -26,6 +28,30 @@ PIPED_INSTANCES = [
 ]
 
 
+# ========== WEB SERVER (Health Check buat Render) ==========
+async def health_check(request):
+    """Health check endpoint buat Render"""
+    return web.json_response({"status": "ok", "bot": "running"})
+
+
+async def start_web_server():
+    """Jalanin web server di background buat health check"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logger.info("Web server started on port 8080")
+    
+    # Biarkan server jalan terus
+    while True:
+        await asyncio.sleep(3600)
+
+
+# ========== TELEGRAM BOT HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler buat command /start"""
     welcome_msg = (
@@ -115,24 +141,22 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def search_youtube(query: str) -> dict | None:
+async def search_youtube(query: str):
     """Cari video di YouTube via Piped API"""
     async with httpx.AsyncClient(timeout=30) as client:
         for instance in PIPED_INSTANCES:
             try:
                 url = f"{instance}/search"
-                params = {
-                    'q': query,
-                    'filter': 'music_songs'
-                }
+                params = {'q': query, 'filter': 'music_songs'}
                 response = await client.get(url, params=params)
                 if response.status_code == 200:
                     data = response.json()
                     if data and len(data) > 0:
-                        # Ambil video pertama
                         video = data[0]
+                        video_url = video.get('url', '')
+                        video_id = video_url.replace('/watch?v=', '') if 'v=' in video_url else video.get('url', '')
                         return {
-                            'id': video.get('url', '').replace('/watch?v=', ''),
+                            'id': video_id,
                             'title': video.get('title', 'Unknown'),
                             'duration': video.get('duration', 0)
                         }
@@ -142,7 +166,7 @@ async def search_youtube(query: str) -> dict | None:
     return None
 
 
-async def get_audio_url(video_id: str) -> str | None:
+async def get_audio_url(video_id: str):
     """Dapatkan URL audio stream dari video YouTube via Piped API"""
     async with httpx.AsyncClient(timeout=30) as client:
         for instance in PIPED_INSTANCES:
@@ -151,10 +175,8 @@ async def get_audio_url(video_id: str) -> str | None:
                 response = await client.get(url)
                 if response.status_code == 200:
                     data = response.json()
-                    # Cari audio stream
                     audio_streams = data.get('audioStreams', [])
                     if audio_streams:
-                        # Ambil audio stream dengan kualitas terbaik (bitrate tertinggi)
                         best_stream = max(audio_streams, key=lambda x: x.get('bitrate', 0))
                         return best_stream.get('url')
             except Exception as e:
@@ -163,18 +185,16 @@ async def get_audio_url(video_id: str) -> str | None:
     return None
 
 
-async def download_audio(query: str) -> str | None:
+async def download_audio(query: str):
     """Download audio dari YouTube via Piped API"""
     try:
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-        # Bersihin file lama
         for f in os.listdir(DOWNLOADS_DIR):
             file_path = os.path.join(DOWNLOADS_DIR, f)
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
-        # Cari video
         logger.info(f"Searching for: {query}")
         video = await search_youtube(query)
         if not video:
@@ -183,7 +203,6 @@ async def download_audio(query: str) -> str | None:
 
         logger.info(f"Found video: {video['title']} (ID: {video['id']})")
 
-        # Dapetin URL audio
         audio_url = await get_audio_url(video['id'])
         if not audio_url:
             logger.error("Failed to get audio URL")
@@ -191,19 +210,20 @@ async def download_audio(query: str) -> str | None:
 
         logger.info("Downloading audio...")
 
-        # Download audio stream
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
             response = await client.get(audio_url)
             if response.status_code == 200:
-                # Simpan sebagai file audio (format asli, biasanya m4a/webm)
                 ext = 'm4a'
-                if 'webm' in response.headers.get('content-type', ''):
+                content_type = response.headers.get('content-type', '')
+                if 'webm' in content_type:
                     ext = 'webm'
-                
+                elif 'mp4' in content_type:
+                    ext = 'm4a'
+
                 file_path = os.path.join(DOWNLOADS_DIR, f"{video['id']}.{ext}")
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
-                
+
                 logger.info(f"Download complete: {file_path}")
                 return file_path
             else:
@@ -215,23 +235,45 @@ async def download_audio(query: str) -> str | None:
         return None
 
 
-def main():
-    """Fungsi utama buat jalanin bot"""
+# ========== MAIN ==========
+async def main():
+    """Fungsi utama - jalanin bot + web server bareng"""
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
         print("❌ ERROR: Token bot belum diisi!")
         print("Silakan isi token di environment variable BOT_TOKEN")
         return
 
+    # Bikin application
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("p", search_and_send))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_and_send))
 
+    # Initialize application
+    await app.initialize()
+
+    # Start web server di background task
+    asyncio.create_task(start_web_server())
+
+    # Start polling
     print("🤖 Bot Musik Mulai Jalan! 🎵")
-    print("Tekan Ctrl+C buat stop")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("Web server di port 8080")
+    await app.start()
+    await app.updater.start_polling()
+
+    # Keep running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
