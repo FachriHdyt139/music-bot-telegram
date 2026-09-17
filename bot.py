@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-import subprocess
+import httpx
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 # Config
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
 PORT = int(os.getenv('PORT', '8080'))
-DOWNLOADS_DIR = 'downloads'
 
 
 # ========== BOT HANDLERS ==========
@@ -41,8 +40,7 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not query:
         await update.message.reply_text(
-            "⚠️ **Lagu apa yang mau diputar?**\n\n"
-            "Ketik: `/p judul lagu`",
+            "⚠️ **Ketik: `/p judul lagu`**",
             parse_mode='Markdown'
         )
         return
@@ -50,24 +48,35 @@ async def cmd_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loading = await update.message.reply_text(f"🔍 **Mencari:** {query}...")
 
     try:
-        logger.info(f"Searching: {query}")
-        audio_path = await download_audio(query)
+        logger.info(f"Search: {query}")
+        result = await search_and_download(query)
 
-        if audio_path and os.path.exists(audio_path):
-            file_size = os.path.getsize(audio_path)
-            logger.info(f"Downloaded: {file_size} bytes")
+        if result:
+            audio_path, title, artist = result
+            if os.path.exists(audio_path):
+                file_size = os.path.getsize(audio_path)
+                logger.info(f"Downloaded: {file_size} bytes")
 
-            if file_size < 1000:
+                if file_size < 1000:
+                    os.remove(audio_path)
+                    await loading.edit_text("❌ **Gagal!** Coba judul lain.")
+                    return
+
+                with open(audio_path, 'rb') as audio:
+                    caption = f"🎵 {title}"
+                    if artist:
+                        caption += f"\n👤 {artist}"
+                    await update.message.reply_audio(
+                        audio=audio,
+                        title=title[:100],
+                        performer=artist or "Unknown"
+                    )
                 os.remove(audio_path)
-                await loading.edit_text("❌ **Gagal!** Coba judul lain.")
-                return
-
-            with open(audio_path, 'rb') as f:
-                await update.message.reply_audio(audio=f, title=query[:100])
-            os.remove(audio_path)
-            await loading.edit_text("✅ **Berhasil!** 🎵")
+                await loading.edit_text(f"✅ **{title}** - {artist}")
+            else:
+                await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
         else:
-            await loading.edit_text("❌ **Gagal download!** Coba judul lain.")
+            await loading.edit_text("❌ **Lagu tidak ditemukan!** Coba judul lain.")
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         await loading.edit_text("❌ **Error!** Coba lagi.")
@@ -85,62 +94,68 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 
-# ========== DOWNLOAD DARI YOUTUBE ==========
-async def download_audio(query: str):
-    """Download audio dari YouTube pakai yt-dlp"""
+# ========== DEEZER API ==========
+async def search_deezer(query: str):
+    """Cari lagu di Deezer API (gratis, gak perlu API key)"""
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            url = f"https://api.deezer.com/search?q={query}&limit=5"
+            r = await client.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                results = data.get('data', [])
+                if results:
+                    return results
+        except Exception as e:
+            logger.error(f"Deezer search error: {e}")
+    return None
+
+
+async def search_and_download(query: str):
+    """Cari & download audio dari Deezer"""
     try:
-        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        os.makedirs('downloads', exist_ok=True)
 
         # Bersihin file lama
-        for f in os.listdir(DOWNLOADS_DIR):
-            fp = os.path.join(DOWNLOADS_DIR, f)
+        for f in os.listdir('downloads'):
+            fp = os.path.join('downloads', f)
             if os.path.isfile(fp):
                 os.remove(fp)
 
-        # Command yt-dlp
-        cmd = [
-            'yt-dlp',
-            '-f', '140',  # format m4a audio only
-            '--extractor-args', 'youtube:player_client=visionos',
-            '--no-playlist',
-            '--no-warnings',
-            '--no-overwrites',
-            '-o', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
-            f'ytsearch1:{query}'
-        ]
-
-        logger.info(f"Running: {' '.join(cmd)}")
-
-        # Jalankan subprocess
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            logger.error(f"yt-dlp error: {stderr.decode()}")
+        # Cari di Deezer
+        results = await search_deezer(query)
+        if not results:
             return None
 
-        logger.info(f"yt-dlp output: {stdout.decode()}")
+        # Ambil yang paling cocok
+        track = results[0]
+        title = track.get('title', 'Unknown')
+        artist = track.get('artist', {}).get('name', 'Unknown')
+        preview_url = track.get('preview', '')
 
-        # Cari file yang terdownload
-        files = os.listdir(DOWNLOADS_DIR)
-        if files:
-            mp3_files = [f for f in files if f.endswith(('.mp3', '.m4a', '.webm', '.opus'))]
-            if mp3_files:
-                latest = max(
-                    [os.path.join(DOWNLOADS_DIR, f) for f in mp3_files],
-                    key=os.path.getmtime
-                )
-                return latest
+        if not preview_url:
+            logger.error("No preview URL found")
+            return None
+
+        logger.info(f"Found: {title} - {artist}")
+        logger.info(f"Preview URL: {preview_url[:80]}...")
+
+        # Download preview (30 detik)
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(preview_url)
+            if r.status_code == 200:
+                file_path = os.path.join('downloads', f"{track.get('id')}.mp3")
+                with open(file_path, 'wb') as f:
+                    f.write(r.content)
+                logger.info(f"Saved: {file_path}")
+                return (file_path, title, artist)
+            else:
+                logger.error(f"Download failed: {r.status_code}")
 
         return None
 
     except Exception as e:
-        logger.error(f"Download error: {e}", exc_info=True)
+        logger.error(f"Search/download error: {e}", exc_info=True)
         return None
 
 
@@ -182,7 +197,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"✅ Web server started on port {PORT}")
+    logger.info(f"✅ Web server on port {PORT}")
 
     await asyncio.Event().wait()
 
