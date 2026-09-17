@@ -1,21 +1,29 @@
 import os
 import logging
 import asyncio
+import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Setup logging biar kita tau ada error apa
+# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Token bot dari BotFather (GANTI DENGAN TOKEN LU!)
+# Token bot dari BotFather
 BOT_TOKEN = os.getenv('BOT_TOKEN', 'TOKEN_LO_DISINI')
 
 # Folder buat temporary storage
 DOWNLOADS_DIR = 'downloads'
+
+# Piped API instances (YouTube proxy gratis)
+PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://piped-api.privacy.com.de',
+    'https://api.piped.yt',
+]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,17 +44,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler buat command .p judul lagu atau pesan biasa"""
-    # Ambil query dari command /p atau dari pesan biasa
+    """Handler buat command /p judul lagu atau pesan .p"""
     if context.args:
         query = ' '.join(context.args)
     elif update.message and update.message.text:
         text = update.message.text
-        # Cek apakah pesan diawali dengan .p
         if text.lower().startswith('.p '):
             query = text[3:].strip()
         else:
-            # Kalau pesan biasa (bukan command), skip
             return
     else:
         await update.message.reply_text(
@@ -65,7 +70,6 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Kirim pesan loading
     loading_msg = await update.message.reply_text(
         f"🔍 **Mencari:** {query}... ⏳\n"
         "Sabar ya, gue download dulu!",
@@ -73,13 +77,11 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Download audio dari YouTube
         audio_path = await download_audio(query)
 
         if audio_path and os.path.exists(audio_path):
-            # Cek file size (Render free plan limit ~512MB RAM)
             file_size = os.path.getsize(audio_path)
-            if file_size > 50 * 1024 * 1024:  # 50MB limit
+            if file_size > 50 * 1024 * 1024:
                 await loading_msg.edit_text(
                     "❌ **File terlalu besar!** ( > 50MB)\n"
                     "Coba judul lagu yang lain.",
@@ -88,15 +90,13 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(audio_path)
                 return
 
-            # Kirim file audio ke user
             with open(audio_path, 'rb') as audio:
                 await update.message.reply_audio(
                     audio=audio,
-                    title=query[:100],  # Telegram limit 100 char
+                    title=query[:100],
                     performer="YouTube Audio"
                 )
 
-            # Hapus file setelah dikirim (hemat memory!)
             os.remove(audio_path)
             await loading_msg.edit_text("✅ **Lagu berhasil dikirim!** 🎉", parse_mode='Markdown')
         else:
@@ -115,100 +115,100 @@ async def search_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def download_audio(query: str) -> str:
-    """Download audio dari YouTube berdasarkan query"""
+async def search_youtube(query: str) -> dict | None:
+    """Cari video di YouTube via Piped API"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        for instance in PIPED_INSTANCES:
+            try:
+                url = f"{instance}/search"
+                params = {
+                    'q': query,
+                    'filter': 'music_songs'
+                }
+                response = await client.get(url, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data and len(data) > 0:
+                        # Ambil video pertama
+                        video = data[0]
+                        return {
+                            'id': video.get('url', '').replace('/watch?v=', ''),
+                            'title': video.get('title', 'Unknown'),
+                            'duration': video.get('duration', 0)
+                        }
+            except Exception as e:
+                logger.warning(f"Piped instance {instance} failed: {e}")
+                continue
+    return None
+
+
+async def get_audio_url(video_id: str) -> str | None:
+    """Dapatkan URL audio stream dari video YouTube via Piped API"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        for instance in PIPED_INSTANCES:
+            try:
+                url = f"{instance}/streams/{video_id}"
+                response = await client.get(url)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Cari audio stream
+                    audio_streams = data.get('audioStreams', [])
+                    if audio_streams:
+                        # Ambil audio stream dengan kualitas terbaik (bitrate tertinggi)
+                        best_stream = max(audio_streams, key=lambda x: x.get('bitrate', 0))
+                        return best_stream.get('url')
+            except Exception as e:
+                logger.warning(f"Piped instance {instance} failed: {e}")
+                continue
+    return None
+
+
+async def download_audio(query: str) -> str | None:
+    """Download audio dari YouTube via Piped API"""
     try:
-        # Bikin folder downloads kalo belum ada
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-        # Hapus file lama di downloads (hemat memory)
+        # Bersihin file lama
         for f in os.listdir(DOWNLOADS_DIR):
             file_path = os.path.join(DOWNLOADS_DIR, f)
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
-        # User agent buat bypass bot detection
-        user_agent = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36'
+        # Cari video
+        logger.info(f"Searching for: {query}")
+        video = await search_youtube(query)
+        if not video:
+            logger.error("No video found")
+            return None
 
-        # Command yt-dlp buat download audio
-        cmd = [
-            'yt-dlp',
-            '--extract-audio',
-            '--audio-format', 'mp3',
-            '--audio-quality', '5',
-            '--max-filesize', '50M',
-            '--no-playlist',
-            '--no-warnings',
-            '--quiet',
-            '--no-overwrites',
-            '--user-agent', user_agent,
-            '--extractor-args', 'youtube:player_client=mweb,web',
-            '--default-search', 'ytsearch1:',
-            '--output', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
-            f'ytsearch1:{query}'
-        ]
+        logger.info(f"Found video: {video['title']} (ID: {video['id']})")
 
-        # Jalankan command
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        # Dapetin URL audio
+        audio_url = await get_audio_url(video['id'])
+        if not audio_url:
+            logger.error("Failed to get audio URL")
+            return None
 
-        stdout, stderr = await process.communicate()
+        logger.info("Downloading audio...")
 
-        # Kalau gagal, coba dengan player_client lain
-        if process.returncode != 0:
-            logger.warning("First attempt failed, trying with different player client...")
-            cmd_fallback = [
-                'yt-dlp',
-                '--extract-audio',
-                '--audio-format', 'mp3',
-                '--audio-quality', '5',
-                '--max-filesize', '50M',
-                '--no-playlist',
-                '--no-warnings',
-                '--quiet',
-                '--no-overwrites',
-                '--user-agent', user_agent,
-                '--extractor-args', 'youtube:player_client=tv',
-                '--default-search', 'ytsearch1:',
-                '--output', f'{DOWNLOADS_DIR}/%(id)s.%(ext)s',
-                f'ytsearch1:{query}'
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd_fallback,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                logger.error(f"yt-dlp error: {stderr.decode()}")
+        # Download audio stream
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.get(audio_url)
+            if response.status_code == 200:
+                # Simpan sebagai file audio (format asli, biasanya m4a/webm)
+                ext = 'm4a'
+                if 'webm' in response.headers.get('content-type', ''):
+                    ext = 'webm'
+                
+                file_path = os.path.join(DOWNLOADS_DIR, f"{video['id']}.{ext}")
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                
+                logger.info(f"Download complete: {file_path}")
+                return file_path
+            else:
+                logger.error(f"Download failed with status: {response.status_code}")
                 return None
-
-        # Cari file yang baru di-download
-        files = os.listdir(DOWNLOADS_DIR)
-        if files:
-            # Ambil file terbaru
-            mp3_files = [f for f in files if f.endswith('.mp3')]
-            if mp3_files:
-                latest_file = max(
-                    [os.path.join(DOWNLOADS_DIR, f) for f in mp3_files],
-                    key=os.path.getmtime
-                )
-                return latest_file
-
-            # Kalau gak ada mp3, ambil file apapun yang terbaru
-            latest_file = max(
-                [os.path.join(DOWNLOADS_DIR, f) for f in files],
-                key=os.path.getmtime
-            )
-            return latest_file
-
-        return None
 
     except Exception as e:
         logger.error(f"Download error: {e}")
@@ -217,22 +217,17 @@ async def download_audio(query: str) -> str:
 
 def main():
     """Fungsi utama buat jalanin bot"""
-    # Cek token
     if BOT_TOKEN == 'TOKEN_LO_DISINI':
         print("❌ ERROR: Token bot belum diisi!")
         print("Silakan isi token di environment variable BOT_TOKEN")
-        print("Atau ganti langsung di kode bot.py")
         return
 
-    # Bikin application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("p", search_and_send))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_and_send))
 
-    # Jalanin bot
     print("🤖 Bot Musik Mulai Jalan! 🎵")
     print("Tekan Ctrl+C buat stop")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
